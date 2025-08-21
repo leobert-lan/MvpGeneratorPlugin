@@ -1,0 +1,22 @@
+<idea-plugin>
+    <id>osp.leobert.plugins.qt.mvpgenerator</id>
+    <name>MVP Generator</name>
+    <version>1.0.0</version>
+    <vendor email="leobert.l@hotmail.com">Leobert</vendor>
+
+    <description>
+        A plugin to generate MVP stub code for CLion/IntelliJ.
+    </description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <actions>
+        <action id="osp.leobert.plugins.qt.mvpgenerator.GenerateMvpAction"
+                class="osp.leobert.plugins.qt.mvpgenerator.GenerateMvpAction"
+                text="Generate MVP Stubs"
+                description="Generate MVP stub code">
+            <!-- 移动到 Project → New 菜单下 -->
+            <add-to-group group-id="NewGroup" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
