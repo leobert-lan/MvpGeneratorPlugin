@@ -3,7 +3,7 @@
 
 #include "I${NAME}Presenter.h"
 #include "ui/base/concurrent/MainThread.h"
-#include "ui/stimulation/library/I${NAME}View.h"
+#include "I${NAME}View.h"
 
 #include "model/Repository.h"
 
