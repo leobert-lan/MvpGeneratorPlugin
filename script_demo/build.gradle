@@ -1,0 +1,360 @@
+import java.util.regex.Pattern
+import java.util.regex.Matcher
+
+// 动态获取 pro 文件
+File findProFile(File rootDir) {
+    // 如果 gradle.properties 有配置，就用配置的
+    if (project.hasProperty("QT_PRO_FILE")) {
+        return file(project.property("QT_PRO_FILE"))
+    }
+    // 否则自动查找
+    def list = rootDir.listFiles().findAll { it.name.endsWith(".pro") }
+    if (list.isEmpty()) {
+        throw new GradleException("未找到 .pro 文件，请配置 QT_PRO_FILE")
+    }
+    if (list.size() > 1) {
+        println "发现多个 .pro 文件，默认使用第一个: ${list[0]}"
+    }
+    return list[0]
+}
+
+List<String> parseQtModules(File proFile) {
+    if (!proFile.exists()) return []
+    def modules = []
+
+    def pattern = ~/^\s*QT\s*\+=\s*(.*)$/
+
+    proFile.eachLine { line ->
+        if (line ==~ pattern) {
+            // 提取模块字符串（如 "core gui"）
+            def moduleString = (line =~ pattern)[0][1]
+            // 按空白分割并过滤空值
+            def m = moduleString.split("\\s+").findAll { !it.isEmpty() }
+            modules.addAll(m)
+        }
+    }
+    println "Qt modules: ${modules}"
+    return modules
+}
+
+
+/**
+ * 构建 CMake 文件替换内容 (find_package 部分)
+ */
+String buildCMakeFindPackage(List<String> qtModules) {
+    if (qtModules.isEmpty()) {
+        return "# TODO: 未检测到 .pro 中的 QT += 模块，请手动修改\n"
+    }
+    def cmakeModules = qtModules.collect { it.capitalize() }
+    def sb = new StringBuilder()
+    sb.append("find_package(Qt6 COMPONENTS ${cmakeModules.join(' ')} REQUIRED)\n")
+    sb.append("target_link_libraries(\${PROJECT_NAME}\n")
+    cmakeModules.each { sb.append("        Qt6::${it}\n") }
+    sb.append(")\n")
+    return sb.toString()
+}
+
+task generateQtProFiles {
+    group = "tools"
+    description = "扫描当前目录，按 .gitignore 和 .proignore 规则输出 Qt .pro 和 CMakeLists.txt 文件内容"
+
+    doLast {
+        File rootDir = project.projectDir
+        File proFile = findProFile(rootDir)
+        File cmakeFile = file("CMakeLists.txt")
+
+        List<String> headers = []
+        List<String> sources = []
+        List<String> forms = []
+
+        scanDir(rootDir, rootDir, [], headers, sources, forms)
+        List<String> qtModules = parseQtModules(proFile)
+
+        // 构建替换内容
+        String proReplace = buildProContent(headers, sources, forms)
+        String cmakeReplace = buildCMakeContent(headers, sources, forms)
+        String cmakeFindPkg = buildCMakeFindPackage(qtModules)
+
+        // 替换 .pro （标识区 # auto generate start/end）
+        replaceSection(proFile, proReplace, "# auto generate start", "# auto generate end")
+        replaceSection(cmakeFile, cmakeReplace, "# auto generate start", "# auto generate end")
+
+        // 替换 CMake find_package 部分
+        replaceSection(cmakeFile, cmakeFindPkg, "# auto find package start", "# auto find package end")
+
+        println "==== 已同步 ${proFile.name} 与 CMakeLists.txt ===="
+    }
+}
+
+// 构建 .pro 文件替换内容，注意 pro 文件中用 \ 续行
+String buildProContent(List<String> headers, List<String> sources, List<String> forms) {
+    def sb = new StringBuilder()
+    sb.append("HEADERS += \\\n")
+    headers.eachWithIndex { it, idx ->
+        sb.append("    ${it}")
+        sb.append(idx == headers.size() - 1 ? "\n" : " \\\n")
+    }
+    sb.append("\nSOURCES += \\\n")
+    sources.eachWithIndex { it, idx ->
+        sb.append("    ${it}")
+        sb.append(idx == sources.size() - 1 ? "\n" : " \\\n")
+    }
+    sb.append("\nFORMS += \\\n")
+    forms.eachWithIndex { it, idx ->
+        sb.append("    ${it}")
+        sb.append(idx == forms.size() - 1 ? "\n" : " \\\n")
+    }
+    return sb.toString()
+}
+
+// 构建 CMakeLists.txt 替换内容
+String buildCMakeContent(List<String> headers, List<String> sources, List<String> forms) {
+    def sb = new StringBuilder()
+    sb.append("set(SOURCES\n")
+    sources.each { sb.append("    ${it}\n") }
+    sb.append(")\n\n")
+
+    sb.append("set(HEADERS\n")
+    headers.each { sb.append("    ${it}\n") }
+    sb.append(")\n\n")
+
+    sb.append("set(FORMS\n")
+    forms.each { sb.append("    ${it}\n") }
+    sb.append(")\n\n")
+
+//     if (!qtModules.isEmpty()) {
+//        // 首字母大写，保持和 Qt6::XXX 对应
+//        def cmakeModules = qtModules.collect { it.capitalize() }
+//        sb.append("find_package(Qt6 COMPONENTS ${cmakeModules.join(' ')} REQUIRED)\n")
+//        sb.append("target_link_libraries(\${PROJECT_NAME}\n")
+//        cmakeModules.each { sb.append("    Qt6::${it}\n") }
+//        sb.append(")\n")
+//     }
+    return sb.toString()
+}
+
+/**
+ * 通用替换函数，支持自动新增标识区
+ */
+void replaceSection(File file, String newContent, String startMark, String endMark) {
+    if (!file.exists()) {
+        println "文件不存在，跳过替换: ${file}"
+        return
+    }
+    String text = file.getText("UTF-8")
+    String pattern = "(?s)(" + Pattern.quote(startMark) + "\\s*).*?(" + Pattern.quote(endMark) + ")"
+
+    if (text =~ pattern) {
+        // 替换标识区
+        text = text.replaceAll(pattern,
+                Matcher.quoteReplacement(startMark + "\n" + newContent.trim() + "\n" + endMark))
+    } else {
+        // 自动新增标识区
+        text = text.trim() + "\n" + startMark + "\n" + "# TODO: 请在此处确认生成的内容是否符合预期\n" + newContent.trim() + "\n" + endMark + "\n"
+    }
+
+    text = text.replaceAll("(?m)(\\n){3,}", "\n\n")
+    file.write(text.trim() + "\n", "UTF-8")
+    println "已更新文件: ${file}"
+}
+
+
+void scanDir(File rootDir, File dir, List<Map> parentPatterns,
+             List<String> headers, List<String> sources, List<String> forms) {
+
+    List<Map> patterns = new ArrayList<>(parentPatterns)
+
+    [".gitignore", ".proignore"].each { ignoreFile ->
+        File file = new File(dir, ignoreFile)
+        if (file.exists()) {
+            file.eachLine { line ->
+                line = line.trim()
+                if (!line || line.startsWith("#")) return
+                boolean negate = line.startsWith("!")
+                if (negate) line = line.substring(1)
+                patterns << [pattern: line, negate: negate]
+            }
+        }
+    }
+
+    dir.eachFile { f ->
+        if (f.name == ".git") return
+
+        String relPath = rootDir.toPath().relativize(f.toPath()).toString().replace("\\", "/")
+
+        if (isIgnored(relPath, f.isDirectory(), patterns)) {
+            if (f.isDirectory()) return
+            else return
+        }
+
+        if (f.isDirectory()) {
+            scanDir(rootDir, f, patterns, headers, sources, forms)
+        } else {
+            def ext = relPath.tokenize('.').last().toLowerCase()
+            switch (ext) {
+                case "h": headers << relPath; break
+                case "cpp": sources << relPath; break
+                case "ui": forms << relPath; break
+            }
+        }
+    }
+}
+
+boolean isIgnored(String relPath, boolean isDir, List<Map> patterns) {
+    boolean ignored = false
+    for (p in patterns) {
+        if (matchGitIgnore(p.pattern, relPath, isDir)) {
+            ignored = !p.negate
+        }
+    }
+    return ignored
+}
+
+boolean matchGitIgnore(String pattern, String path, boolean isDir) {
+    if (pattern.endsWith("/") && !isDir) return false
+    pattern = pattern.replaceAll("\\\\", "/")
+
+    String regex = pattern
+            .replace(".", "\\.")
+            .replace("**", ".*")
+            .replace("*", "[^/]*")
+            .replace("?", ".")
+    if (pattern.startsWith("/")) {
+        regex = "^" + regex.substring(1) + "\$"
+    } else {
+        regex = ".*" + regex + "\$"
+    }
+    return path ==~ regex
+}
+
+task allocateQtGen {
+    group = "tools"
+    description = "在 CMakeLists.txt 中插入构建目录 include 设置（CLion 跳转用）"
+
+    doLast {
+        File cmakeFile = file("${project.projectDir}/CMakeLists.txt")
+
+        if (!cmakeFile.exists()) {
+            println "CMakeLists.txt 不存在"
+            return
+        }
+
+        String startMark = "# auto allocate QtGen start"
+        String endMark = "# auto allocate QtGen end"
+
+        // 从 gradle.properties 读取
+        String cmakeBinaryDirProp = project.hasProperty("CMAKE_BINARY_DIR") ? project.property("CMAKE_BINARY_DIR") : null
+        if (!cmakeBinaryDirProp) {
+            println "gradle.properties 中未配置 CMAKE_BINARY_DIR"
+            return
+        }
+
+        // 统一路径分隔符
+        String relativeBuildDir = cmakeBinaryDirProp.replace("\\", "/")
+
+        String genContent = """
+# ===== Qt 生成的 UI 头文件目录（自动生成，请勿手动修改） =====
+set(UI_GEN_DIR "${relativeBuildDir}")
+include_directories(\${UI_GEN_DIR})
+# ===== 以上为自动生成内容 =====
+""".trim()
+
+        String cmakeText = cmakeFile.getText("UTF-8")
+        String pattern = "(?s)(" + Pattern.quote(startMark) + "\\s*).*?(" + Pattern.quote(endMark) + ")"
+        String safeReplacement = Matcher.quoteReplacement(startMark + "\n" + genContent + "\n" + endMark)
+
+        if (cmakeText =~ pattern) {
+            cmakeText = cmakeText.replaceAll(pattern,
+                    Matcher.quoteReplacement(startMark + "\n" + genContent.trim() + "\n" + endMark))
+        } else {
+            cmakeText = cmakeText.trim() + "\n" + startMark + "\n" + genContent.trim() + "\n" + endMark + "\n"
+        }
+
+        cmakeText = cmakeText.replaceAll("(?m)(\\n){3,}", "\n\n")
+        cmakeFile.write(cmakeText.trim() + "\n", "UTF-8")
+
+        println "已更新 CMakeLists.txt 的 QtGen include 配置，路径: ${relativeBuildDir}"
+    }
+}
+
+
+group 'qt'
+
+
+def createQtTasks(String mode) {
+    def buildDir = "${projectDir}/build/Desktop_Qt_6_4_0_MSVC2019_64bit-${mode}"
+
+    task("qtSetupBuildDir${mode}") {
+        group = 'qt'
+        description = "创建 Qt ${mode} 构建目录"
+        doLast {
+            def dir = file(buildDir)
+            if (!dir.exists()) dir.mkdirs()
+            def releaseDir = file("${buildDir}/release")
+            if (!releaseDir.exists()) releaseDir.mkdirs()
+        }
+    }
+
+    task("qtBuild${mode}", type: Exec) {
+        group = 'qt'
+        description = "构建 Qt ${mode} 项目"
+        dependsOn "qtSetupBuildDir${mode}"
+
+        commandLine 'cmd', '/c', "build-qt.bat", mode
+
+        doLast {
+            "copyDependencies${mode}"
+        }
+    }
+
+    task("copyDependencies${mode}", type: Copy) {
+        group = "qt"
+        // 源文件目录
+        def vlcSourceDir = file(projectDir.absolutePath + "/thirdParty")
+        def lslSourceDir = file(projectDir.absolutePath + "/third_party/liblsl/lib")
+        // 目标目录
+        def destDir = file("$buildDir/${mode.toString().toLowerCase()}")
+
+        from(vlcSourceDir) {
+            include "libvlc.dll", "libvlccore.dll"
+        }
+        from("${vlcSourceDir.path}/plugins") {
+            into "plugins" // 在目标目录中创建 plugins 子目录
+        }
+        from(lslSourceDir) {
+            include "lsl.dll"
+        }
+
+        def sqlDir = file(projectDir.absolutePath + "/doc/sql")
+        from(sqlDir) {
+            into "sql"
+        }
+
+        into destDir // 指定拷贝的目标根目录
+
+        doLast {
+            println "VLC 运行时依赖,sql已成功拷贝到: $destDir"
+        }
+    }
+
+    task("qtBuildRun${mode}", type: Exec) {
+        group = 'qt'
+        description = "重新构建并运行 Qt ${mode} 可执行文件"
+        dependsOn "qtBuild${mode}"
+
+        commandLine 'cmd', '/c', "build-qt.bat", "Run${mode}"
+    }
+
+    task("qtRun${mode}", type: Exec) {
+        group = 'qt'
+        description = "运行 Qt ${mode} 可执行文件"
+
+        commandLine 'cmd', '/c', "build-qt.bat", "Run${mode}"
+    }
+}
+
+
+// 创建 Debug 和 Release 任务
+createQtTasks("Debug")
+createQtTasks('Release')
+
